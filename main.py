@@ -4,174 +4,100 @@ import tqdm
 from ase import Atoms
 from ase.visualize import view
 import plotly.graph_objects as go
-from torch_scatter import scatter
+import plotly.express as px
 import torch.nn.functional as F
+from torch_scatter import scatter
+from torch import backends
 
-device = 'cpu'
-chain_length = 80
+from utils import initialize_force_matrix, init_chain, get_force_list, apply_force, get_dihedral
+
+device = 'cuda'
+chain_length = 20
 num_beads = chain_length * 2
-base_pairs = [[0, -1],
-              [1, -2],
-              [2, -3],
-              [3, -4],
-              [22, -33],
-              [23, -34],
-              [24, -35],
-              [60, 70],
-              [61, -69],
+base_pairs = [[5, 18],
+              [6, 17],
+              [7, 16]
               ]
-time_steps = 100000
+time_steps = 10000
 time_step = .001
 
 BACKBONE_SPACING = 1.5  # 1.5
 BASE_SPACING = BACKBONE_SPACING
+INIT_POSITIONAL_NOISE = .1
+HELIX_ANGLE = 0.15
+
 backbone_force_constant = 100
 soft_force_constant = 25
 repulsive_force_constant = 500
+dihedral_force_constant = 50
 
 '''
 initialize sequence as straight line
 '''
-bead_coords = np.arange(chain_length).repeat(2)[:, None] * np.array((1, 0, 0))[None, :].repeat(num_beads, axis=0) * BACKBONE_SPACING
-bead_coords[1::2, 1] += BASE_SPACING
-bead_coords += np.random.randn(*bead_coords.shape) * 0.1
-bead_type = np.tile([6, 5], chain_length)
+bead_coords, bead_type = init_chain(chain_length, num_beads, BACKBONE_SPACING, BASE_SPACING, INIT_POSITIONAL_NOISE)
 
 '''
 initialize force constants
 '''
-LJ_forces = np.zeros((num_beads, num_beads))
-for i in range(num_beads):
-    if bead_type[i] == 6:  # backbone bead - bind to backbone neighbors and adjacent nucleobase
-        if (i + 2) < num_beads:  # bind to backbone neighbor
-            LJ_forces[i, i + 2] = backbone_force_constant
-        LJ_forces[i, i + 1] = backbone_force_constant  # bind to nucleobase
-LJ_forces += LJ_forces.T
-LJ_forces = torch.Tensor(LJ_forces)
+backbone_force_matrix = \
+    initialize_force_matrix(num_beads, bead_type, mode='backbone', strength=backbone_force_constant)
+pair_attraction_force_matrix = \
+    initialize_force_matrix(num_beads, bead_type, mode='pairs', base_pairs=base_pairs, strength=soft_force_constant)
+repulsive_force_matrix = \
+    torch.ones((num_beads, num_beads)) * repulsive_force_constant
+repulsive_force_matrix.fill_diagonal_(0)
 
-attractive_forces = np.zeros((num_beads, num_beads))
-for pair in base_pairs:
-    attractive_forces[2 * pair[0] + 1, 2 * pair[1] + 1] = soft_force_constant
+backbone_force_list, backbone_pair_inds = \
+    get_force_list(backbone_force_matrix, device)
+pair_attraction_force_list, pair_attraction_pair_inds = \
+    get_force_list(pair_attraction_force_matrix, device)
+repulsive_force_list, repulsive_pair_inds = \
+    get_force_list(repulsive_force_matrix, device)
 
-attractive_forces += attractive_forces.T
-attractive_forces = torch.Tensor(attractive_forces)
-
-repulsive_forces = torch.zeros_like(attractive_forces)
-for i in range(num_beads):
-    for j in range(num_beads):
-        if (attractive_forces[i, j]) == 0 and (LJ_forces[i, j] == 0):
-            repulsive_forces[i, j] = repulsive_force_constant
-
-num_LJ_forces = torch.sum(torch.count_nonzero(LJ_forces))
-LJ_forces_list = np.zeros(num_LJ_forces)
-LJ_forces_pair_inds = np.zeros((num_LJ_forces, 2), dtype=np.int32)
+dihedral_tuples_list = np.zeros((chain_length - 1, 4))
 ind = 0
-for i in range(num_beads):
-    for j in range(num_beads):
-        if LJ_forces[i, j] != 0:
-            LJ_forces_list[ind] = LJ_forces[i, j]
-            LJ_forces_pair_inds[ind] = i, j
-            ind += 1
+for i in range(0, num_beads - 2, 2):  # define dihedral frames from base to base
+    dihedral_tuples_list[ind, :] = i+1, i, i + 2, i + 3
+    ind += 1
 
-num_attractive_forces = torch.sum(torch.count_nonzero(attractive_forces))
-attractive_forces_list = np.zeros(num_attractive_forces)
-attractive_forces_pair_inds = np.zeros((num_attractive_forces, 2), dtype=np.int32)
-ind = 0
-for i in range(num_beads):
-    for j in range(num_beads):
-        if attractive_forces[i, j] != 0:
-            attractive_forces_list[ind] = attractive_forces[i, j]
-            attractive_forces_pair_inds[ind] = i, j
-            ind += 1
-
-num_repulsive_forces = torch.sum(torch.count_nonzero(repulsive_forces)) - num_beads
-repulsive_forces_list = np.zeros(num_repulsive_forces)
-repulsive_forces_pair_inds = np.zeros((num_repulsive_forces, 2), dtype=np.int32)
-ind = 0
-for i in range(num_beads):
-    for j in range(num_beads):
-        if repulsive_forces[i, j] != 0:
-            if i != j:
-                repulsive_forces_list[ind] = repulsive_forces[i, j]
-                repulsive_forces_pair_inds[ind] = i, j
-                ind += 1
-
-
-def enforce_1d_bound(x: torch.tensor, x_span, x_center, mode='soft'):  # soft or hard
-    """
-    constrains function to range x_center plus/minus x_span
-    Parameters
-    ----------
-    x
-    x_span
-    x_center
-    mode
-
-    Returns
-    -------
-
-    """
-    if mode == 'soft':  # smoothly converge to (center-span,center+span)
-        bounded = F.tanh((x - x_center) / x_span) * x_span + x_center
-    elif mode == 'hard':  # linear scaling to hard stop at [center-span, center+span]
-        bounded = F.hardtanh((x - x_center) / x_span) * x_span + x_center
-    else:
-        raise ValueError("bound must be of type 'hard' or 'soft'")
-
-    return bounded
-
-
-def LJ_pot(dists, magnitude, radius):
-    d6 = torch.pow(radius / dists, 6)
-    return 4 * magnitude * (d6 ** 2 - d6)
-
-
-def LJ_force(dists, magnitude, radius):
-    d6 = radius ** 6 / torch.pow(dists, 7)
-    d12 = radius ** 12 / torch.pow(dists, 13)
-    return 48 * magnitude * (d12 - 0.5 * magnitude * d6)
-
-
-def HARM_force(dists, magnitude, radius):
-    return - 2 * magnitude * (dists - radius)
-
+dihedral_tuples_list = torch.tensor(dihedral_tuples_list, device=device, dtype=torch.long)
 
 '''
 propagate
 '''
-repulsive_forces_list = torch.Tensor(repulsive_forces_list).to(device)
-attractive_forces_list = torch.Tensor(attractive_forces_list).to(device)
-LJ_forces_list = torch.Tensor(LJ_forces_list).to(device)
-
 trajectory = torch.zeros((time_steps, num_beads, 3)).to(device)
 current_coords = torch.Tensor(bead_coords).to(device)
-LJ_forces_pair_inds = torch.tensor(LJ_forces_pair_inds, dtype=torch.long).to(device)
-attractive_forces_pair_inds = torch.tensor(attractive_forces_pair_inds, dtype=torch.long).to(device)
-repulsive_forces_pair_inds = torch.tensor(repulsive_forces_pair_inds, dtype=torch.long).to(device)
 
-for ts in tqdm.tqdm(range(time_steps)):
-    LJ_pair_vectors = current_coords[LJ_forces_pair_inds[:, 0]] - current_coords[LJ_forces_pair_inds[:, 1]]
-    vector_norms = torch.linalg.norm(LJ_pair_vectors, dim=-1)
-    LJ_force_magnitude = HARM_force(vector_norms, LJ_forces_list, BACKBONE_SPACING)
-    LJ_force_vectors = LJ_pair_vectors / vector_norms[:, None] * LJ_force_magnitude[:, None]
+force_types = ['backbone', 'pair attraction', 'repulsive']
+forces_lists = [backbone_force_list, pair_attraction_force_list, repulsive_force_list]
+pair_inds_lists = [backbone_pair_inds, pair_attraction_pair_inds, repulsive_pair_inds]
 
-    attractive_pair_vectors = current_coords[attractive_forces_pair_inds[:, 0]] - current_coords[attractive_forces_pair_inds[:, 1]]
-    vector_norms = torch.linalg.norm(attractive_pair_vectors, dim=-1)
-    attractive_force_magnitude = -torch.abs((vector_norms > BASE_SPACING) * attractive_forces_list)
-    attractive_force_vectors = attractive_pair_vectors / vector_norms[:, None] * attractive_force_magnitude[:, None]
+if device == 'cuda':
+    backends.cudnn.benchmark = True  # auto-optimizes certain backend processes
 
-    repulsive_pair_vectors = current_coords[repulsive_forces_pair_inds[:, 0]] - current_coords[repulsive_forces_pair_inds[:, 1]]
-    vector_norms = torch.linalg.norm(repulsive_pair_vectors, dim=-1)
-    repulsive_force_magnitude = torch.abs((vector_norms < (1.2 * BACKBONE_SPACING)) * repulsive_forces_list)
-    repulsive_force_vectors = repulsive_pair_vectors / vector_norms[:, None] * repulsive_force_magnitude[:, None]
+with torch.no_grad():
+    for ts in tqdm.tqdm(range(time_steps)):
+        atomwise_forces = []
 
-    current_coords += torch.randn_like(current_coords).to(device) * 0.01 + \
-                      scatter(LJ_force_vectors, LJ_forces_pair_inds[:, 0], dim=0, reduce='sum') * time_step + \
-                      scatter(attractive_force_vectors, attractive_forces_pair_inds[:, 0], dim=0, reduce='sum') * time_step + \
-                      scatter(repulsive_force_vectors, repulsive_forces_pair_inds[:, 0], dim=0, reduce='sum') * time_step
+        # pairwise forces
+        for force_type, force_list, pair_inds in zip(force_types, forces_lists, pair_inds_lists):
+            atomwise_forces.extend(apply_force(force_type, force_list, pair_inds, current_coords, BACKBONE_SPACING, BASE_SPACING))  # gather all forces
 
-    trajectory[ts] = current_coords
-    assert torch.sum(torch.isnan(current_coords)) == 0
+        # dihedral (helical) force
+        dihedral_angles = get_dihedral(dihedral_tuples_list, current_coords)
+        dihedral_force = -2*dihedral_force_constant*(dihedral_angles - HELIX_ANGLE)
+        # todo compute force vector
+        for i in range(len(dihedral_force)):
+            dihedral_inds = dihedral_tuples_list[i]
+            axial_coords = current_coords[dihedral_inds[1:2]]
+            dihedral_axis = axial_coords[1]-axial_coords[0]
+            arm1 = current_coords[dihedral_inds[0]] - current_coords[dihedral_inds[1]]
+            arm2 = current_coords[dihedral_inds[3]] - current_coords[dihedral_inds[2]]
+
+        current_coords += scatter(torch.stack(atomwise_forces), torch.cat(pair_inds_lists)[:, 0], dim=0, reduce='sum', dim_size=num_beads) * time_step \
+                          + torch.randn_like(current_coords).to(device) * 0.01  # small amount of random jitter
+
+        trajectory[ts] = current_coords
 
 trajectory = trajectory.cpu()
 
@@ -179,13 +105,11 @@ print_steps = np.arange(time_steps - torch.sum(torch.isnan(trajectory[:, 0, 0]))
 steps = [Atoms(symbols=bead_type, positions=trajectory[i]) for i in print_steps]
 view(steps)
 
-import plotly.express as px
-
-# fig = px.imshow(LJ_forces)
+# fig = px.imshow(backbone_force_matrix)
 # fig.show()
-# fig = px.imshow(attractive_forces)
+# fig = px.imshow(pair_attraction_force_matrix)
 # fig.show()
-# fig = px.imshow(repulsive_forces)
+# fig = px.imshow(repulsive_force_matrix)
 # fig.show()
 
 dists = torch.cdist(trajectory[-1, :], trajectory[-1, :])
